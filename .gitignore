@@ -1,32 +1,38 @@
 # Environment variables and secrets
 .env
+.env.*
+!.env.example
 
-# Virtual environment
+# Telegram session files & credentials
+*.session
+*.session-journal
+secrets/
+*.key
+
+# Python cache & virtual environment
 .venv/
 venv/
 ENV/
-
-# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 
-# SQLite databases
+# SQLite and data files
 data/*.db
 data/*.sqlite
 data/*.sqlite3
 *.db
 *.sqlite
 
-# IDE and OS files
+# IDE & OS
 .vscode/
 .idea/
 *.swp
 *.swo
 .DS_Store
 
-# Test / coverage artifacts
+# Test artifacts
 .pytest_cache/
 .coverage
 htmlcov/

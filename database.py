@@ -1,59 +1,59 @@
-"""SQLite database layer using aiosqlite for MishkaBot."""
+"""SQLite database layer for logging real Telegram Gift transactions and deduplication."""
 
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import aiosqlite
 
-from utils.mishka import MishkaRarity
-
 
 class Database:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        # Ensure parent directory exists
         db_file = Path(db_path)
         db_file.parent.mkdir(parents=True, exist_ok=True)
 
     async def init_db(self) -> None:
-        """Initialize tables and indices in SQLite."""
+        """Initialize SQLite tables for gift delivery history and metrics."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL;")
-            
-            # Users table
+
+            # Table for real gift drops audit log
             await db.execute(
                 """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS gift_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
                     username TEXT,
                     first_name TEXT NOT NULL,
                     last_name TEXT,
-                    common_count INTEGER NOT NULL DEFAULT 0,
-                    rare_count INTEGER NOT NULL DEFAULT 0,
-                    epic_count INTEGER NOT NULL DEFAULT 0,
-                    legendary_count INTEGER NOT NULL DEFAULT 0,
-                    total_count INTEGER NOT NULL DEFAULT 0,
-                    first_drop_at TEXT,
-                    last_drop_at TEXT
+                    gift_id TEXT NOT NULL,
+                    star_cost INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL
                 );
                 """
             )
             await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_users_total ON users(total_count DESC);"
+                "CREATE INDEX IF NOT EXISTS idx_deliveries_user ON gift_deliveries(user_id);"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_deliveries_status ON gift_deliveries(status);"
             )
 
-            # Global bot statistics table
+            # Table for global message counter
             await db.execute(
                 """
-                CREATE TABLE IF NOT EXISTS bot_stats (
+                CREATE TABLE IF NOT EXISTS bot_metrics (
                     key TEXT PRIMARY KEY,
                     value INTEGER NOT NULL DEFAULT 0
                 );
                 """
             )
             await db.execute(
-                "INSERT OR IGNORE INTO bot_stats (key, value) VALUES ('messages_processed', 0);"
+                "INSERT OR IGNORE INTO bot_metrics (key, value) VALUES ('messages_processed', 0);"
             )
+
             await db.commit()
 
     async def increment_messages_processed(self, amount: int = 1) -> None:
@@ -61,84 +61,88 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
-                INSERT INTO bot_stats (key, value) VALUES ('messages_processed', ?)
+                INSERT INTO bot_metrics (key, value) VALUES ('messages_processed', ?)
                 ON CONFLICT(key) DO UPDATE SET value = value + ?;
                 """,
                 (amount, amount),
             )
             await db.commit()
 
-    async def record_drop(
+    async def record_gift_delivery(
         self,
         user_id: int,
         first_name: str,
+        gift_id: str,
+        star_cost: int,
+        status: str,
         username: Optional[str] = None,
         last_name: Optional[str] = None,
-        rarity: MishkaRarity = MishkaRarity.COMMON,
-    ) -> Dict[str, Any]:
-        """
-        Record a mishka drop for a user atomically.
-        Creates the user row if not exists or updates counts and timestamps.
-        """
+        error_message: Optional[str] = None,
+    ) -> int:
+        """Record real gift drop attempt and result."""
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-        col_map = {
-            MishkaRarity.COMMON: "common_count",
-            MishkaRarity.RARE: "rare_count",
-            MishkaRarity.EPIC: "epic_count",
-            MishkaRarity.LEGENDARY: "legendary_count",
-        }
-        target_column = col_map[rarity]
-
         async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-
-            # Upsert user record
-            query = f"""
-                INSERT INTO users (
+            cursor = await db.execute(
+                """
+                INSERT INTO gift_deliveries (
                     user_id, username, first_name, last_name,
-                    {target_column}, total_count, first_drop_at, last_drop_at
-                ) VALUES (?, ?, ?, ?, 1, 1, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username = excluded.username,
-                    first_name = excluded.first_name,
-                    last_name = excluded.last_name,
-                    {target_column} = {target_column} + 1,
-                    total_count = total_count + 1,
-                    last_drop_at = excluded.last_drop_at;
-            """
-            await db.execute(
-                query,
-                (user_id, username, first_name, last_name, now_iso, now_iso),
+                    gift_id, star_cost, status, error_message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    gift_id,
+                    star_cost,
+                    status,
+                    error_message,
+                    now_iso,
+                ),
             )
             await db.commit()
+            return cursor.lastrowid or 0
 
-            # Retrieve updated user stats
-            async with db.execute(
-                "SELECT * FROM users WHERE user_id = ?;", (user_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else {}
-
-    async def get_user_stats(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Get mishka statistics for a specific user."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM users WHERE user_id = ?;", (user_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
-
-    async def get_top_users(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get leaderboard of top users sorted by total mishkas."""
+    async def get_user_gifts_stats(self, user_id: int) -> Dict[str, Any]:
+        """Get statistics of real gifts successfully received by user."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
-                SELECT * FROM users
-                WHERE total_count > 0
-                ORDER BY total_count DESC, last_drop_at ASC
+                SELECT
+                    COUNT(id) AS total_gifts_received,
+                    COALESCE(SUM(star_cost), 0) AS total_stars_value,
+                    MAX(created_at) AS last_gift_at
+                FROM gift_deliveries
+                WHERE user_id = ? AND status = 'SUCCESS';
+                """,
+                (user_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else {
+                    "total_gifts_received": 0,
+                    "total_stars_value": 0,
+                    "last_gift_at": None,
+                }
+
+    async def get_top_receivers(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get leaderboard of top users by real gifts received."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    first_name,
+                    COUNT(id) AS total_gifts,
+                    SUM(star_cost) AS total_stars,
+                    MAX(created_at) AS last_gift_at
+                FROM gift_deliveries
+                WHERE status = 'SUCCESS'
+                GROUP BY user_id
+                ORDER BY total_gifts DESC, total_stars DESC
                 LIMIT ?;
                 """,
                 (limit,),
@@ -146,39 +150,31 @@ class Database:
                 rows = await cursor.fetchall()
                 return [dict(r) for r in rows]
 
-    async def get_bot_stats(self) -> Dict[str, Any]:
-        """Aggregate global statistics of the bot."""
+    async def get_global_gift_stats(self) -> Dict[str, Any]:
+        """Get global metrics on processed messages and real gifts sent."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
 
-            # Messages processed
             async with db.execute(
-                "SELECT value FROM bot_stats WHERE key = 'messages_processed';"
+                "SELECT value FROM bot_metrics WHERE key = 'messages_processed';"
             ) as cursor:
                 row = await cursor.fetchone()
-                messages_processed = row["value"] if row else 0
+                messages_count = row["value"] if row else 0
 
-            # Sum of mishkas by type and total users
             async with db.execute(
                 """
                 SELECT
-                    COUNT(user_id) AS total_users,
-                    COALESCE(SUM(total_count), 0) AS total_mishkas,
-                    COALESCE(SUM(common_count), 0) AS common_total,
-                    COALESCE(SUM(rare_count), 0) AS rare_total,
-                    COALESCE(SUM(epic_count), 0) AS epic_total,
-                    COALESCE(SUM(legendary_count), 0) AS legendary_total
-                FROM users
-                WHERE total_count > 0;
+                    COUNT(id) AS total_sent,
+                    COALESCE(SUM(star_cost), 0) AS total_stars_spent,
+                    COUNT(DISTINCT user_id) AS unique_winners
+                FROM gift_deliveries
+                WHERE status = 'SUCCESS';
                 """
             ) as cursor:
                 row = await cursor.fetchone()
                 return {
-                    "messages_processed": messages_processed,
-                    "total_users": row["total_users"] if row else 0,
-                    "total_mishkas": row["total_mishkas"] if row else 0,
-                    "common_total": row["common_total"] if row else 0,
-                    "rare_total": row["rare_total"] if row else 0,
-                    "epic_total": row["epic_total"] if row else 0,
-                    "legendary_total": row["legendary_total"] if row else 0,
+                    "messages_processed": messages_count,
+                    "total_gifts_sent": row["total_sent"] if row else 0,
+                    "total_stars_spent": row["total_stars_spent"] if row else 0,
+                    "unique_winners": row["unique_winners"] if row else 0,
                 }

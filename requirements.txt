@@ -1,5 +1,8 @@
-# mishkabot requirements
+# Core Telegram Bot & Async Dependencies
 aiogram>=3.17.0,<4.0.0
 aiosqlite>=0.20.0,<1.0.0
 python-dotenv>=1.0.0,<2.0.0
 aiohttp>=3.9.0
+
+# Optional MTProto user session client
+telethon>=1.36.0,<2.0.0

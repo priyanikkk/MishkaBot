@@ -1,9 +1,9 @@
-"""Configuration management for MishkaBot."""
+"""Configuration management for Telegram Gifts & Stars Bot."""
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Set
+from typing import Any, List, Optional, Set
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -18,12 +18,16 @@ class ConfigValidationError(Exception):
 @dataclass
 class Config:
     bot_token: str
-    mishka_chance: float
-    common_chance: float
-    rare_chance: float
-    epic_chance: float
-    legendary_chance: float
-    database_path: str
+    gift_drop_chance: float = 5.0
+    target_chat_id: Optional[int] = None
+    enabled_gift_ids: Set[str] = field(default_factory=set)
+    max_gift_price_stars: int = 0  # 0 means no price cap
+    telegram_api_id: Optional[int] = None
+    telegram_api_hash: Optional[str] = None
+    telegram_phone: Optional[str] = None
+    session_name: str = "secrets/user_session"
+    stars_source: str = "bot"  # 'bot' or 'user_session'
+    database_path: str = "data/bot.db"
     spam_cooldown_seconds: float = 3.0
     admin_ids: Set[int] = field(default_factory=set)
 
@@ -31,49 +35,48 @@ class Config:
         """Validate configuration settings."""
         if not self.bot_token:
             raise ConfigValidationError(
-                "BOT_TOKEN не задан! Укажите токен бота в файле .env или переменной окружения BOT_TOKEN."
+                "BOT_TOKEN не задан! Укажите токен бота в файле .env или переменной окружения."
             )
 
-        if not (0.0 <= self.mishka_chance <= 100.0):
+        if not (0.0 <= self.gift_drop_chance <= 100.0):
             raise ConfigValidationError(
-                f"MISHKA_CHANCE должен быть в диапазоне от 0 до 100! Текущее значение: {self.mishka_chance}"
+                f"GIFT_DROP_CHANCE должен быть в диапазоне от 0 до 100! Текущее значение: {self.gift_drop_chance}"
             )
 
-        types_sum = round(
-            self.common_chance + self.rare_chance + self.epic_chance + self.legendary_chance, 4
-        )
-        if types_sum != 100.0:
+        if self.stars_source not in ("bot", "user_session"):
             raise ConfigValidationError(
-                f"Ошибка конфигурации! Сумма вероятностей типов мишек должна быть ровно 100%. "
-                f"Текущая сумма: {types_sum}% ("
-                f"Обычный: {self.common_chance}%, "
-                f"Редкий: {self.rare_chance}%, "
-                f"Эпический: {self.epic_chance}%, "
-                f"Легендарный: {self.legendary_chance}%)"
+                f"STARS_SOURCE должен быть 'bot' или 'user_session'! Получено: {self.stars_source}"
             )
 
-        for name, val in [
-            ("COMMON_MISHKA_CHANCE", self.common_chance),
-            ("RARE_MISHKA_CHANCE", self.rare_chance),
-            ("EPIC_MISHKA_CHANCE", self.epic_chance),
-            ("LEGENDARY_MISHKA_CHANCE", self.legendary_chance),
-        ]:
-            if not (0.0 <= val <= 100.0):
-                raise ConfigValidationError(
-                    f"{name} должен быть в диапазоне от 0 до 100! Текущее значение: {val}"
-                )
+        if self.stars_source == "user_session" and (not self.telegram_api_id or not self.telegram_api_hash):
+            raise ConfigValidationError(
+                "При STARS_SOURCE=user_session необходимо указать TELEGRAM_API_ID и TELEGRAM_API_HASH!"
+            )
 
 
-def parse_admin_ids(raw_value: str) -> Set[int]:
-    """Parse comma-separated admin IDs string."""
-    ids: Set[int] = set()
+def parse_id_set(raw_value: str) -> Set[int]:
+    """Parse comma-separated integer IDs string."""
+    result: Set[int] = set()
     if not raw_value:
-        return ids
+        return result
     for part in raw_value.split(","):
         cleaned = part.strip()
-        if cleaned.isdigit():
-            ids.add(int(cleaned))
-    return ids
+        # Handle negative chat IDs (e.g. -100123456789)
+        if cleaned.lstrip("-").isdigit():
+            result.add(int(cleaned))
+    return result
+
+
+def parse_string_set(raw_value: str) -> Set[str]:
+    """Parse comma-separated string IDs."""
+    result: Set[str] = set()
+    if not raw_value:
+        return result
+    for part in raw_value.split(","):
+        cleaned = part.strip()
+        if cleaned:
+            result.add(cleaned)
+    return result
 
 
 def load_config(env_file: Path | str | None = None) -> Config:
@@ -82,40 +85,54 @@ def load_config(env_file: Path | str | None = None) -> Config:
     if path.exists():
         load_dotenv(dotenv_path=path, override=True)
     else:
-        # Fallback to system environment
         load_dotenv(override=True)
 
     bot_token = os.getenv("BOT_TOKEN", "").strip()
 
     try:
-        mishka_chance = float(os.getenv("MISHKA_CHANCE", "5"))
+        gift_drop_chance = float(os.getenv("GIFT_DROP_CHANCE", "5.0"))
     except ValueError:
-        mishka_chance = 5.0
+        gift_drop_chance = 5.0
+
+    target_chat_raw = os.getenv("TARGET_CHAT_ID", "").strip()
+    target_chat_id: Optional[int] = None
+    if target_chat_raw and target_chat_raw.lstrip("-").isdigit():
+        target_chat_id = int(target_chat_raw)
+
+    enabled_gift_ids = parse_string_set(os.getenv("ENABLED_GIFT_IDS", ""))
 
     try:
-        common_chance = float(os.getenv("COMMON_MISHKA_CHANCE", "70"))
-        rare_chance = float(os.getenv("RARE_MISHKA_CHANCE", "20"))
-        epic_chance = float(os.getenv("EPIC_MISHKA_CHANCE", "8"))
-        legendary_chance = float(os.getenv("LEGENDARY_MISHKA_CHANCE", "2"))
-    except ValueError as e:
-        raise ConfigValidationError(f"Некорректное числовое значение в шансах мишек: {e}")
+        max_gift_price_stars = int(os.getenv("MAX_GIFT_PRICE_STARS", "0"))
+    except ValueError:
+        max_gift_price_stars = 0
 
-    database_path = os.getenv("DATABASE_PATH", "data/mishka.db").strip()
+    api_id_raw = os.getenv("TELEGRAM_API_ID", "").strip()
+    api_id = int(api_id_raw) if api_id_raw.isdigit() else None
+    api_hash = os.getenv("TELEGRAM_API_HASH", "").strip() or None
+    phone = os.getenv("TELEGRAM_PHONE", "").strip() or None
+    session_name = os.getenv("SESSION_NAME", "secrets/user_session").strip()
+    stars_source = os.getenv("STARS_SOURCE", "bot").strip().lower()
+
+    database_path = os.getenv("DATABASE_PATH", "data/bot.db").strip()
 
     try:
         spam_cooldown = float(os.getenv("SPAM_COOLDOWN_SECONDS", "3.0"))
     except ValueError:
         spam_cooldown = 3.0
 
-    admin_ids = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
+    admin_ids = parse_id_set(os.getenv("ADMIN_IDS", ""))
 
     cfg = Config(
         bot_token=bot_token,
-        mishka_chance=mishka_chance,
-        common_chance=common_chance,
-        rare_chance=rare_chance,
-        epic_chance=epic_chance,
-        legendary_chance=legendary_chance,
+        gift_drop_chance=gift_drop_chance,
+        target_chat_id=target_chat_id,
+        enabled_gift_ids=enabled_gift_ids,
+        max_gift_price_stars=max_gift_price_stars,
+        telegram_api_id=api_id,
+        telegram_api_hash=api_hash,
+        telegram_phone=phone,
+        session_name=session_name,
+        stars_source=stars_source,
         database_path=database_path,
         spam_cooldown_seconds=spam_cooldown,
         admin_ids=admin_ids,
@@ -124,7 +141,7 @@ def load_config(env_file: Path | str | None = None) -> Config:
     return cfg
 
 
-def update_env_variable(key: str, value: str | int | float, env_file: Path | str | None = None) -> None:
+def update_env_variable(key: str, value: Any, env_file: Path | str | None = None) -> None:
     """Safely update or add an environment variable in the .env file."""
     path = Path(env_file) if env_file else ENV_PATH
     key_str = str(key).strip()
@@ -154,5 +171,4 @@ def update_env_variable(key: str, value: str | int | float, env_file: Path | str
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(new_lines)
 
-    # Also update in current process environment
     os.environ[key_str] = val_str

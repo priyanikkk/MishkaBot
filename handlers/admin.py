@@ -1,38 +1,31 @@
-"""Admin commands handler: /setchance, /settype, /stats, /reload."""
+"""Admin commands handler: /setchance, /gifts, /togglegift, /status, /reload."""
 
 import logging
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from config import Config, load_config, update_env_variable, ConfigValidationError
 from database import Database
 from utils.filters import AdminFilter
-from utils.mishka import (
-    MishkaRarity,
-    MISHKA_TYPES,
-    parse_rarity,
-)
+from utils.gifts import gift_service
+from utils.mtproto import MTProtoSessionManager
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="admin_router")
-# Apply AdminFilter to all messages in this router
 router.message.filter(AdminFilter())
 
 
 @router.message(Command("setchance"))
 async def cmd_set_chance(message: Message, command: CommandObject, config: Config) -> None:
-    """
-    Handle /setchance <percent>
-    Example: /setchance 5
-    """
+    """Handle /setchance <percent>."""
     args = command.args
     if not args:
         await message.reply(
             "ℹ️ <b>Использование:</b> <code>/setchance &lt;процент&gt;</code>\n"
-            f"Текущий общий шанс: <b>{config.mishka_chance:g}%</b>\n\n"
-            "<i>Пример:</i> <code>/setchance 5</code>",
+            f"Текущий шанс: <b>{config.gift_drop_chance:g}%</b>\n\n"
+            "<i>Пример:</i> <code>/setchance 5</code> (означает 5% на каждое сообщение)",
             parse_mode="HTML",
         )
         return
@@ -41,151 +34,160 @@ async def cmd_set_chance(message: Message, command: CommandObject, config: Confi
         new_chance = float(args.replace(",", ".").strip())
     except ValueError:
         await message.reply(
-            "❌ Некорректное число! Укажите число от 0 до 100.\n<i>Пример:</i> <code>/setchance 7.5</code>",
+            "❌ Некорректное число! Укажите процент от 0 до 100.",
             parse_mode="HTML",
         )
         return
 
     if not (0.0 <= new_chance <= 100.0):
         await message.reply(
-            "❌ Шанс должен быть в диапазоне от <b>0</b> до <b>100%</b>!",
+            "❌ Шанс должен быть в диапазоне от 0 до 100%!",
             parse_mode="HTML",
         )
         return
 
-    # Update in-memory config and persist to .env
-    config.mishka_chance = new_chance
-    update_env_variable("MISHKA_CHANCE", f"{new_chance:g}")
+    config.gift_drop_chance = new_chance
+    update_env_variable("GIFT_DROP_CHANCE", f"{new_chance:g}")
 
-    logger.info("Admin %s updated MISHKA_CHANCE to %s%%", message.from_user.id, new_chance)
+    logger.info("Admin %s updated GIFT_DROP_CHANCE to %s%%", message.from_user.id, new_chance)
     await message.reply(
-        f"✅ <b>Общий шанс выпадения мишки успешно изменен на {new_chance:g}%!</b>\n"
-        "Настройка сохранена в <code>.env</code> и будет действовать после перезапуска.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("settype"))
-async def cmd_set_type(message: Message, command: CommandObject, config: Config) -> None:
-    """
-    Handle /settype <type> <percentage>
-    Example: /settype common 70
-    """
-    args = (command.args or "").split()
-    if len(args) != 2:
-        await message.reply(
-            "ℹ️ <b>Использование:</b> <code>/settype &lt;тип&gt; &lt;процент&gt;</code>\n\n"
-            "<b>Допустимые типы:</b>\n"
-            f"• <code>common</code> (текущий: {config.common_chance:g}%)\n"
-            f"• <code>rare</code> (текущий: {config.rare_chance:g}%)\n"
-            f"• <code>epic</code> (текущий: {config.epic_chance:g}%)\n"
-            f"• <code>legendary</code> (текущий: {config.legendary_chance:g}%)\n\n"
-            "<i>Пример:</i> <code>/settype common 70</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    type_raw, percent_raw = args[0], args[1]
-    rarity = parse_rarity(type_raw)
-    if not rarity:
-        await message.reply(
-            f"❌ Неизвестный тип мишки: <code>{type_raw}</code>!\n"
-            "Доступные варианты: <code>common</code>, <code>rare</code>, <code>epic</code>, <code>legendary</code>.",
-            parse_mode="HTML",
-        )
-        return
-
-    try:
-        new_val = float(percent_raw.replace(",", ".").strip())
-    except ValueError:
-        await message.reply(
-            "❌ Некорректный процент! Укажите число от 0 до 100.",
-            parse_mode="HTML",
-        )
-        return
-
-    if not (0.0 <= new_val <= 100.0):
-        await message.reply(
-            "❌ Процент должен быть в диапазоне от 0 до 100!",
-            parse_mode="HTML",
-        )
-        return
-
-    # Calculate test sum before applying
-    c = new_val if rarity == MishkaRarity.COMMON else config.common_chance
-    r = new_val if rarity == MishkaRarity.RARE else config.rare_chance
-    e = new_val if rarity == MishkaRarity.EPIC else config.epic_chance
-    l = new_val if rarity == MishkaRarity.LEGENDARY else config.legendary_chance
-
-    test_sum = round(c + r + e + l, 4)
-    if test_sum != 100.0:
-        await message.reply(
-            "❌ <b>Ошибка: Сумма вероятностей всех типов должна быть ровно 100%!</b>\n\n"
-            f"С этим изменением сумма составила бы: <b>{test_sum:g}%</b>\n\n"
-            "<b>Текущие значения:</b>\n"
-            f"• 🧸 common: {config.common_chance:g}%\n"
-            f"• 🐻 rare: {config.rare_chance:g}%\n"
-            f"• 🐼 epic: {config.epic_chance:g}%\n"
-            f"• 🐨 legendary: {config.legendary_chance:g}%\n\n"
-            "<i>Скорректируйте остальные типы, чтобы суммарно получилось ровно 100%.</i>",
-            parse_mode="HTML",
-        )
-        return
-
-    # Apply changes
-    env_keys = {
-        MishkaRarity.COMMON: "COMMON_MISHKA_CHANCE",
-        MishkaRarity.RARE: "RARE_MISHKA_CHANCE",
-        MishkaRarity.EPIC: "EPIC_MISHKA_CHANCE",
-        MishkaRarity.LEGENDARY: "LEGENDARY_MISHKA_CHANCE",
-    }
-
-    if rarity == MishkaRarity.COMMON:
-        config.common_chance = new_val
-    elif rarity == MishkaRarity.RARE:
-        config.rare_chance = new_val
-    elif rarity == MishkaRarity.EPIC:
-        config.epic_chance = new_val
-    elif rarity == MishkaRarity.LEGENDARY:
-        config.legendary_chance = new_val
-
-    update_env_variable(env_keys[rarity], f"{new_val:g}")
-
-    info = MISHKA_TYPES[rarity]
-    logger.info("Admin %s updated %s to %s%%", message.from_user.id, env_keys[rarity], new_val)
-    await message.reply(
-        f"✅ Вероятность для <b>{info.emoji} {info.name}</b> успешно изменена на <b>{new_val:g}%</b>!\n"
-        f"Сумма всех типов: <b>100%</b>.\n"
+        f"✅ <b>Шанс выпадения реального подарка изменен на {new_chance:g}%!</b>\n"
         "Настройка сохранена в <code>.env</code>.",
         parse_mode="HTML",
     )
 
 
-@router.message(Command("stats"))
-async def cmd_stats(message: Message, database: Database) -> None:
-    """Handle /stats command — show global bot metrics."""
-    stats = await database.get_bot_stats()
+@router.message(Command("gifts"))
+async def cmd_gifts(message: Message, bot: Bot, config: Config) -> None:
+    """Handle /gifts command — display real Telegram Gifts from Telegram API."""
+    await message.reply("⏳ Загружаю актуальный каталог подарков из Telegram API...")
 
-    msg_count = stats.get("messages_processed", 0)
-    total_drops = stats.get("total_mishkas", 0)
-    users_count = stats.get("total_users", 0)
-    common_c = stats.get("common_total", 0)
-    rare_c = stats.get("rare_total", 0)
-    epic_c = stats.get("epic_total", 0)
-    legend_c = stats.get("legendary_total", 0)
+    gifts = await gift_service.get_available_gifts(bot, force_refresh=True)
+    if not gifts:
+        await message.reply(
+            "⚠️ В данный момент Telegram API не вернул доступных подарков "
+            "или метод временно недоступен.",
+            parse_mode="HTML",
+        )
+        return
 
-    drop_ratio = (total_drops / msg_count * 100) if msg_count > 0 else 0.0
+    lines = [
+        f"🎁 <b>Актуальные подарки Telegram ({len(gifts)} шт.):</b>\n",
+        "<i>Для включения/выключения используйте:</i> <code>/togglegift &lt;ID&gt;</code>\n",
+    ]
+
+    for g in gifts[:15]:  # Display up to 15 to fit message limits
+        is_enabled = (not config.enabled_gift_ids) or (g.id in config.enabled_gift_ids)
+        status_emoji = "✅" if is_enabled else "❌"
+
+        rem_text = (
+            f"осталось {g.remaining_count:,}"
+            if g.remaining_count is not None
+            else "неограниченно"
+        )
+        lines.append(
+            f"{status_emoji} <b>ID:</b> <code>{g.id}</code> | <b>{g.star_count} ⭐</b> | {rem_text}"
+        )
+
+    if len(gifts) > 15:
+        lines.append(f"\n<i>... и еще {len(gifts) - 15} подарков в каталоге.</i>")
+
+    await message.reply("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("togglegift"))
+async def cmd_toggle_gift(message: Message, command: CommandObject, config: Config) -> None:
+    """Handle /togglegift <gift_id> — toggle a specific gift in the drop pool."""
+    gift_id = (command.args or "").strip()
+    if not gift_id:
+        await message.reply(
+            "ℹ️ <b>Использование:</b> <code>/togglegift &lt;ID_подарка&gt;</code>\n"
+            "Список доступных ID смотрите в команде <code>/gifts</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    if gift_id in config.enabled_gift_ids:
+        config.enabled_gift_ids.remove(gift_id)
+        action_text = "отключен из пула выпадения ❌"
+    else:
+        config.enabled_gift_ids.add(gift_id)
+        action_text = "добавлен в пул выпадения ✅"
+
+    # Persist back to .env
+    new_val = ",".join(sorted(config.enabled_gift_ids))
+    update_env_variable("ENABLED_GIFT_IDS", new_val)
+
+    await message.reply(
+        f"🎁 Подарок <code>{gift_id}</code> теперь <b>{action_text}</b>.\n"
+        f"Всего выбрано подарков: <b>{len(config.enabled_gift_ids)}</b> (если 0 — разрешены все).",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("status"))
+async def cmd_status(message: Message, bot: Bot, config: Config, database: Database) -> None:
+    """Handle /status command — comprehensive live diagnostics."""
+    # 1. Telegram Bot connection
+    try:
+        bot_user = await bot.get_me()
+        bot_status = f"✅ Подключен (@{bot_user.username})"
+    except Exception as e:
+        bot_status = f"❌ Ошибка: {e}"
+
+    # 2. MTProto session status
+    session_mgr = MTProtoSessionManager(config)
+    is_session_auth, session_details = await session_mgr.check_session_status()
+    session_status = (
+        f"✅ Авторизован ({session_details})"
+        if is_session_auth
+        else f"ℹ️ {session_details}"
+    )
+
+    # 3. Telegram Stars balance
+    star_balance = await gift_service.get_star_balance(bot)
+
+    # 4. Available gifts and affordability
+    gifts = await gift_service.get_available_gifts(bot)
+    min_gift_price = min([g.star_count for g in gifts]) if gifts else 0
+    can_send_gifts = (star_balance >= min_gift_price) and (len(gifts) > 0)
+    gifts_status = (
+        f"✅ Доступна (Мин. цена: {min_gift_price} ⭐)"
+        if can_send_gifts
+        else f"⚠️ Недостаточно Stars (Мин. нужно: {min_gift_price} ⭐)"
+    )
+
+    # 5. Global gift deliveries metrics
+    stats = await database.get_global_gift_stats()
+
+    # 6. Target Group
+    target_chat_info = (
+        f"<code>{config.target_chat_id}</code>"
+        if config.target_chat_id
+        else "Любая группа, где бот состоит"
+    )
+
+    # 7. Enabled gifts info
+    enabled_info = (
+        f"{len(config.enabled_gift_ids)} конкретных ID"
+        if config.enabled_gift_ids
+        else "Все доступные в каталоге"
+    )
 
     text = (
-        "📊 <b>Глобальная статистика MishkaBot:</b>\n\n"
-        f"💬 <b>Обработано сообщений:</b> {msg_count:,}\n"
-        f"🎁 <b>Всего мишек выдано:</b> {total_drops:,} ({drop_ratio:.2f}% от сообщений)\n"
-        f"👥 <b>Пользователей с мишками:</b> {users_count:,}\n\n"
-        "<b>Количество выданных по типам:</b>\n"
-        f"🧸 Обычных: <b>{common_c:,}</b>\n"
-        f"🐻 Редких: <b>{rare_c:,}</b>\n"
-        f"🐼 Эпических: <b>{epic_c:,}</b>\n"
-        f"🐨 Легендарных: <b>{legend_c:,}</b>"
+        "📊 <b>Статус системы Telegram Gifts & Stars:</b>\n\n"
+        f"🤖 <b>Telegram Bot API:</b> {bot_status}\n"
+        f"📱 <b>Пользовательская сессия:</b> {session_status}\n"
+        f"⭐ <b>Текущий баланс Stars бота:</b> <b>{star_balance:,} ⭐</b>\n"
+        f"🎁 <b>Отправка подарков:</b> {gifts_status}\n"
+        f"🎯 <b>Шанс выпадения:</b> <b>{config.gift_drop_chance:g}%</b>\n"
+        f"👥 <b>Подключенная группа:</b> {target_chat_info}\n"
+        f"🏷️ <b>Выбранные подарки:</b> {enabled_info}\n\n"
+        "<b>📈 Статистика работы:</b>\n"
+        f"💬 Обработано сообщений: <b>{stats['messages_processed']:,}</b>\n"
+        f"🎉 Успешно отправлено подарков: <b>{stats['total_gifts_sent']:,}</b>\n"
+        f"⭐ Всего потрачено Stars: <b>{stats['total_stars_spent']:,} ⭐</b>\n"
+        f"👤 Уникальных победителей: <b>{stats['unique_winners']:,}</b>"
     )
     await message.reply(text, parse_mode="HTML")
 
@@ -194,37 +196,23 @@ async def cmd_stats(message: Message, database: Database) -> None:
 async def cmd_reload(message: Message, config: Config) -> None:
     """Handle /reload command — reload settings from .env."""
     try:
-        new_config = load_config()
-        # Copy attributes into existing config object
-        config.mishka_chance = new_config.mishka_chance
-        config.common_chance = new_config.common_chance
-        config.rare_chance = new_config.rare_chance
-        config.epic_chance = new_config.epic_chance
-        config.legendary_chance = new_config.legendary_chance
-        config.database_path = new_config.database_path
-        config.spam_cooldown_seconds = new_config.spam_cooldown_seconds
-        config.admin_ids = new_config.admin_ids
+        new_cfg = load_config()
+        config.gift_drop_chance = new_cfg.gift_drop_chance
+        config.target_chat_id = new_cfg.target_chat_id
+        config.enabled_gift_ids = new_cfg.enabled_gift_ids
+        config.max_gift_price_stars = new_cfg.max_gift_price_stars
+        config.stars_source = new_cfg.stars_source
+        config.spam_cooldown_seconds = new_cfg.spam_cooldown_seconds
+        config.admin_ids = new_cfg.admin_ids
 
-        logger.info("Config successfully reloaded by admin %s", message.from_user.id)
         await message.reply(
             "🔄 <b>Настройки успешно перезагружены из <code>.env</code>!</b>\n\n"
-            f"• Общий шанс: <b>{config.mishka_chance:g}%</b>\n"
-            f"• Обычный: <b>{config.common_chance:g}%</b>\n"
-            f"• Редкий: <b>{config.rare_chance:g}%</b>\n"
-            f"• Эпический: <b>{config.epic_chance:g}%</b>\n"
-            f"• Легендарный: <b>{config.legendary_chance:g}%</b>",
+            f"• Шанс: <b>{config.gift_drop_chance:g}%</b>\n"
+            f"• Группа: <code>{config.target_chat_id or 'любая'}</code>\n"
+            f"• Лимит цены: <b>{config.max_gift_price_stars or 'нет'} ⭐</b>",
             parse_mode="HTML",
         )
     except ConfigValidationError as e:
-        logger.error("Failed to reload config: %s", e)
-        await message.reply(
-            f"❌ <b>Ошибка валидации при перезагрузке:</b>\n{e}\n\n"
-            "Старые настройки остались активными.",
-            parse_mode="HTML",
-        )
+        await message.reply(f"❌ Ошибка валидации: {e}", parse_mode="HTML")
     except Exception as e:
-        logger.exception("Unexpected error reloading config")
-        await message.reply(
-            f"❌ Непредвиденная ошибка при перезагрузке: <code>{e}</code>",
-            parse_mode="HTML",
-        )
+        await message.reply(f"❌ Ошибка перезагрузки: {e}", parse_mode="HTML")

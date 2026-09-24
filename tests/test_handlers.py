@@ -1,48 +1,33 @@
-"""Integration tests for MishkaBot handlers and admin flows."""
+"""Integration tests for Telegram Gifts & Stars bot handlers."""
 
-import tempfile
 import shutil
-from pathlib import Path
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from aiogram.types import Chat, Message, User
 from aiogram.filters import CommandObject
+from aiogram.types import Chat, Gift, Message, StarAmount, User
 
 from config import Config
 from database import Database
-from handlers.commands import cmd_start, cmd_me, cmd_top, cmd_chance
-from handlers.admin import cmd_set_chance, cmd_set_type, cmd_stats, cmd_reload
-from handlers.messages import handle_group_message, _PROCESSED_SET, _PROCESSED_MESSAGES
-from utils.mishka import MishkaRarity
+from handlers.admin import cmd_gifts, cmd_reload, cmd_set_chance, cmd_status, cmd_toggle_gift
+from handlers.commands import cmd_chance, cmd_me, cmd_start, cmd_top
+from handlers.messages import _PROCESSED_MESSAGES, _PROCESSED_SET, handle_group_message
+from utils.gifts import gift_service
 
 
 class TestHandlersIntegration(unittest.IsolatedAsyncioTestCase):
-    """Test handlers with mocked Telegram messages and real database/config."""
-
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.mkdtemp()
         self.db_path = str(Path(self.temp_dir) / "test.db")
-        self.env_path = Path(self.temp_dir) / ".env"
-        self.env_path.write_text(
-            "BOT_TOKEN=123:ABC\n"
-            "MISHKA_CHANCE=5\n"
-            "COMMON_MISHKA_CHANCE=70\n"
-            "RARE_MISHKA_CHANCE=20\n"
-            "EPIC_MISHKA_CHANCE=8\n"
-            "LEGENDARY_MISHKA_CHANCE=2\n"
-            f"DATABASE_PATH={self.db_path}\n",
-            encoding="utf-8",
-        )
         self.config = Config(
             bot_token="123:ABC",
-            mishka_chance=5.0,
-            common_chance=70.0,
-            rare_chance=20.0,
-            epic_chance=8.0,
-            legendary_chance=2.0,
+            gift_drop_chance=5.0,
+            target_chat_id=-100123456789,
+            max_gift_price_stars=50,
             database_path=self.db_path,
-            spam_cooldown_seconds=0.0,  # disable cooldown for tests
+            spam_cooldown_seconds=0.0,
             admin_ids={999},
         )
         self.database = Database(self.db_path)
@@ -60,7 +45,7 @@ class TestHandlersIntegration(unittest.IsolatedAsyncioTestCase):
         first_name: str = "Иван",
         username: str = "ivan_user",
         is_bot: bool = False,
-        chat_type: str = "supergroup",
+        chat_id: int = -100123456789,
         message_id: int = 1,
     ) -> MagicMock:
         msg = MagicMock(spec=Message)
@@ -74,8 +59,9 @@ class TestHandlersIntegration(unittest.IsolatedAsyncioTestCase):
         msg.from_user.is_bot = is_bot
 
         msg.chat = MagicMock(spec=Chat)
-        msg.chat.id = -100123456789
-        msg.chat.type = chat_type
+        msg.chat.id = chat_id
+        msg.chat.title = "Тестовая группа"
+        msg.chat.type = "supergroup"
 
         msg.answer = AsyncMock()
         msg.reply = AsyncMock()
@@ -85,114 +71,113 @@ class TestHandlersIntegration(unittest.IsolatedAsyncioTestCase):
         msg = self.create_mock_message("/start")
         await cmd_start(msg, self.config)
         msg.answer.assert_called_once()
-        self.assertIn("MishkaBot", msg.answer.call_args[0][0])
+        self.assertIn("Telegram Gifts", msg.answer.call_args[0][0])
 
-    async def test_cmd_me_empty_and_with_bears(self) -> None:
+    async def test_cmd_me(self) -> None:
         msg = self.create_mock_message("/me", user_id=12345)
-        # 1. When user has no bears
+        # Empty
         await cmd_me(msg, self.database)
-        msg.reply.assert_called_once()
-        self.assertIn("У тебя пока нет мишек", msg.reply.call_args[0][0])
+        self.assertIn("У вас пока нет выигранных подарков", msg.reply.call_args[0][0])
 
-        # 2. Award some bears
-        await self.database.record_drop(12345, "Иван", "ivan_user", rarity=MishkaRarity.COMMON)
-        await self.database.record_drop(12345, "Иван", "ivan_user", rarity=MishkaRarity.EPIC)
-
+        # After winning
+        await self.database.record_gift_delivery(
+            user_id=12345,
+            first_name="Иван",
+            gift_id="star_gift",
+            star_cost=25,
+            status="SUCCESS",
+        )
         msg.reply.reset_mock()
         await cmd_me(msg, self.database)
-        msg.reply.assert_called_once()
-        reply_text = msg.reply.call_args[0][0]
-        self.assertIn("Обычных: <b>1</b>", reply_text)
-        self.assertIn("Эпических: <b>1</b>", reply_text)
-        self.assertIn("Всего мишек: 2", reply_text)
+        self.assertIn("1 шт.", msg.reply.call_args[0][0])
+        self.assertIn("25 ⭐", msg.reply.call_args[0][0])
 
     async def test_cmd_top(self) -> None:
         msg = self.create_mock_message("/top")
-        # Empty leaderboard
         await cmd_top(msg, self.database)
-        self.assertIn("Пока никто не нашел", msg.reply.call_args[0][0])
+        self.assertIn("Пока никто в чате не выиграл подарки", msg.reply.call_args[0][0])
 
-        # Add 2 users
-        await self.database.record_drop(1, "User1", "u1", rarity=MishkaRarity.COMMON)
-        await self.database.record_drop(1, "User1", "u1", rarity=MishkaRarity.COMMON)
-        await self.database.record_drop(2, "User2", "u2", rarity=MishkaRarity.LEGENDARY)
-
+        await self.database.record_gift_delivery(
+            user_id=1,
+            first_name="Победитель",
+            gift_id="star_gift",
+            star_cost=100,
+            status="SUCCESS",
+        )
         msg.reply.reset_mock()
         await cmd_top(msg, self.database)
-        reply_text = msg.reply.call_args[0][0]
-        self.assertIn("🥇 @u1 — <b>2</b> шт.", reply_text)
-        self.assertIn("🥈 @u2 — <b>1</b> шт.", reply_text)
-
-    async def test_cmd_chance(self) -> None:
-        msg = self.create_mock_message("/chance")
-        await cmd_chance(msg, self.config)
-        msg.reply.assert_called_once()
-        reply_text = msg.reply.call_args[0][0]
-        self.assertIn("5%", reply_text)
-        self.assertIn("70%", reply_text)
+        self.assertIn("Победитель", msg.reply.call_args[0][0])
 
     async def test_admin_set_chance(self) -> None:
-        msg = self.create_mock_message("/setchance 15", user_id=999)
-        cmd_obj = CommandObject(prefix="/", command="setchance", args="15")
+        msg = self.create_mock_message("/setchance 12.5")
+        cmd_obj = CommandObject(prefix="/", command="setchance", args="12.5")
 
         with patch("handlers.admin.update_env_variable") as mock_update:
             await cmd_set_chance(msg, cmd_obj, self.config)
-            self.assertEqual(self.config.mishka_chance, 15.0)
-            mock_update.assert_called_once_with("MISHKA_CHANCE", "15")
-            self.assertIn("успешно изменен на 15%", msg.reply.call_args[0][0])
+            self.assertEqual(self.config.gift_drop_chance, 12.5)
+            mock_update.assert_called_once_with("GIFT_DROP_CHANCE", "12.5")
+            self.assertIn("изменен на 12.5%", msg.reply.call_args[0][0])
 
-    async def test_admin_set_type_valid_and_invalid(self) -> None:
-        # Invalid sum (setting epic to 20 makes sum 70+20+20+2 = 112%)
-        msg = self.create_mock_message("/settype epic 20", user_id=999)
-        cmd_obj = CommandObject(prefix="/", command="settype", args="epic 20")
-        await cmd_set_type(msg, cmd_obj, self.config)
-        self.assertIn("Сумма вероятностей всех типов должна быть ровно 100%", msg.reply.call_args[0][0])
-        self.assertEqual(self.config.epic_chance, 8.0)  # Unchanged
+    async def test_admin_gifts_and_toggle(self) -> None:
+        bot = MagicMock()
+        mock_gift = MagicMock(spec=Gift)
+        mock_gift.id = "gift_teddy_1"
+        mock_gift.star_count = 25
+        mock_gift.remaining_count = 100
 
-        # Valid sum adjustment: first set epic 10, then rare 18 -> sum 70 + 18 + 10 + 2 = 100%
-        # Let's adjust epic to 10 when rare is 18:
-        self.config.rare_chance = 18.0
-        msg.reply.reset_mock()
-        cmd_obj = CommandObject(prefix="/", command="settype", args="epic 10")
-        with patch("handlers.admin.update_env_variable") as mock_update:
-            await cmd_set_type(msg, cmd_obj, self.config)
-            self.assertEqual(self.config.epic_chance, 10.0)
-            mock_update.assert_called_once_with("EPIC_MISHKA_CHANCE", "10")
-            self.assertIn("успешно изменена на <b>10%</b>", msg.reply.call_args[0][0])
+        with patch.object(gift_service, "get_available_gifts", return_value=[mock_gift]):
+            msg = self.create_mock_message("/gifts")
+            await cmd_gifts(msg, bot, self.config)
+            self.assertIn("gift_teddy_1", msg.reply.call_args[0][0])
 
-    async def test_admin_stats(self) -> None:
-        await self.database.increment_messages_processed(42)
-        await self.database.record_drop(1, "Тест", rarity=MishkaRarity.RARE)
-        msg = self.create_mock_message("/stats", user_id=999)
-        await cmd_stats(msg, self.database)
-        reply_text = msg.reply.call_args[0][0]
-        self.assertIn("Обработано сообщений:</b> 42", reply_text)
-        self.assertIn("Всего мишек выдано:</b> 1", reply_text)
+        # Test toggle gift
+        msg_toggle = self.create_mock_message("/togglegift gift_teddy_1")
+        cmd_obj = CommandObject(prefix="/", command="togglegift", args="gift_teddy_1")
+        with patch("handlers.admin.update_env_variable"):
+            await cmd_toggle_gift(msg_toggle, cmd_obj, self.config)
+            self.assertIn("gift_teddy_1", self.config.enabled_gift_ids)
 
-    async def test_message_drop_and_bot_ignore(self) -> None:
+    async def test_admin_status(self) -> None:
+        bot = MagicMock()
+        bot.get_me = AsyncMock(return_value=MagicMock(username="mishka_test_bot"))
+        bot.get_my_star_balance = AsyncMock(return_value=StarAmount(amount=250, nanostar_amount=0))
+        bot.get_available_gifts = AsyncMock(return_value=MagicMock(gifts=[]))
+
+        msg = self.create_mock_message("/status")
+        await cmd_status(msg, bot, self.config, self.database)
+        reply = msg.reply.call_args[0][0]
+        self.assertIn("250 ⭐", reply)
+        self.assertIn("mishka_test_bot", reply)
+
+    async def test_group_message_handling(self) -> None:
+        bot = MagicMock()
+        bot.send_gift = AsyncMock(return_value=True)
+
+        mock_gift = MagicMock(spec=Gift)
+        mock_gift.id = "gift_777"
+        mock_gift.star_count = 50
+
         # 1. Message from bot is ignored
-        bot_msg = self.create_mock_message("Привет", is_bot=True, message_id=101)
-        await handle_group_message(bot_msg, self.database, self.config)
+        bot_msg = self.create_mock_message("bot text", is_bot=True, message_id=1)
+        await handle_group_message(bot_msg, bot, self.database, self.config)
         bot_msg.reply.assert_not_called()
 
-        # 2. Regular message with 100% chance awards mishka
-        self.config.mishka_chance = 100.0
-        user_msg = self.create_mock_message("Привет всем!", message_id=102)
-        await handle_group_message(user_msg, self.database, self.config)
-        user_msg.reply.assert_called_once()
-        self.assertIn("Поздравляем!", user_msg.reply.call_args[0][0])
+        # 2. Message from wrong group is ignored
+        wrong_chat_msg = self.create_mock_message("hello", chat_id=-99999, message_id=2)
+        await handle_group_message(wrong_chat_msg, bot, self.database, self.config)
+        wrong_chat_msg.reply.assert_not_called()
 
-        # Check DB was updated
-        user_stats = await self.database.get_user_stats(user_msg.from_user.id)
-        self.assertEqual(user_stats["total_count"], 1)
-
-        # 3. Duplicate message delivery is ignored
-        user_msg.reply.reset_mock()
-        await handle_group_message(user_msg, self.database, self.config)
-        user_msg.reply.assert_not_called()
-        # Count remains 1
-        user_stats = await self.database.get_user_stats(user_msg.from_user.id)
-        self.assertEqual(user_stats["total_count"], 1)
+        # 3. Winning roll sends real gift
+        self.config.gift_drop_chance = 100.0
+        with patch.object(
+            gift_service, "select_gift_for_drop", return_value=(mock_gift, 200, "OK")
+        ):
+            with patch.object(gift_service, "send_real_gift", return_value=(True, None)):
+                user_msg = self.create_mock_message("привет!", message_id=3)
+                await handle_group_message(user_msg, bot, self.database, self.config)
+                user_msg.reply.assert_called_once()
+                self.assertIn("настоящий Telegram Gift", user_msg.reply.call_args[0][0])
+                self.assertIn("50 ⭐", user_msg.reply.call_args[0][0])
 
 
 if __name__ == "__main__":
